@@ -2,6 +2,7 @@ import torch
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import os
@@ -17,6 +18,15 @@ app = FastAPI(
     title="IoT Attack Detection API",
     description="GNN-based IoT attack detection using Graph Convolutional Networks",
     version="1.0.0"
+)
+
+# Configure CORS for all endpoints
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],  # Explicitly allow frontend
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Explicit methods
+    allow_headers=["*"],  # Allows all headers
 )
 
 # Global variables to store model and preprocessing state
@@ -255,6 +265,12 @@ def predict_single_flow(x_tensor: torch.Tensor) -> Dict[str, Any]:
         "benign_probability": float(benign_prob)
     }
 
+# {
+#     "prediction": "Benign",
+#     "probability": 0.7524957060813904,
+#     "is_attack": false,
+#     "confidence": "High"
+# }
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(flow: FlowData):
     """
@@ -289,6 +305,35 @@ async def predict(flow: FlowData):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
+# Response
+# {
+#     "predictions": [
+#         {
+#             "index": 0,
+#             "prediction": "Benign",
+#             "probability": 0.752507209777832,
+#             "is_attack": false,
+#             "confidence": "High",
+#             "attack_probability": 0.24749280512332916,
+#             "benign_probability": 0.752507209777832
+#         },
+#         {
+#             "index": 1,
+#             "prediction": "Benign",
+#             "probability": 0.752507209777832,
+#             "is_attack": false,
+#             "confidence": "High",
+#             "attack_probability": 0.24749280512332916,
+#             "benign_probability": 0.752507209777832
+#         }
+#     ],
+#     "summary": {
+#         "total": 2,
+#         "attacks": 0,
+#         "benign": 2,
+#         "attack_rate": 0.0
+#     }
+# }
 @app.post("/predict/batch", response_model=BatchPredictionResponse)
 async def predict_batch(batch: BatchFlowData):
     """

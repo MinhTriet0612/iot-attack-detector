@@ -1,13 +1,16 @@
 import torch
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import os
 import sys
 import pickle
+import tempfile
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Add current directory to path to import main
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -465,6 +468,114 @@ async def info():
         "num_parameters": sum(p.numel() for p in model.parameters()) if model else 0,
         "feature_columns": feature_columns[:10] if feature_columns else []  # Show first 10
     }
+
+
+@app.post("/analyze/pcap")
+async def analyze_pcap(file: UploadFile = File(...)):
+    """
+    Upload và phân tích file PCAP sử dụng PyShark.
+    
+    Args:
+        file: File PCAP upload
+        
+    Returns:
+        Kết quả phân tích các flows trong file PCAP
+    """
+    if not model_loaded or model is None or scaler is None or feature_columns is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Model not loaded. Please check server logs."
+        )
+    
+    # Validate file extension
+    if not file.filename.endswith(('.pcap', '.pcapng', '.cap')):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload a PCAP file (.pcap, .pcapng, .cap)"
+        )
+    
+    try:
+        # Import pyshark helper
+        from pyshark_helper import extract_flows_from_pcap
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pcap') as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+        
+        try:
+            # Run PyShark in thread pool to avoid event loop conflict
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                flow_features_list = await loop.run_in_executor(
+                    executor, extract_flows_from_pcap, tmp_path
+                )
+            
+            if not flow_features_list:
+                return {
+                    "filename": file.filename,
+                    "status": "no_flows",
+                    "message": "No network flows found in the PCAP file",
+                    "predictions": [],
+                    "summary": {"total": 0, "attacks": 0, "benign": 0, "attack_rate": 0.0}
+                }
+            
+            # Predict each flow
+            results = []
+            attack_count = 0
+            benign_count = 0
+            
+            for i, flow_features in enumerate(flow_features_list):
+                try:
+                    x_tensor = preprocess_flow(flow_features)
+                    prediction = predict_single_flow(x_tensor)
+                    
+                    if prediction["is_attack"]:
+                        attack_count += 1
+                    else:
+                        benign_count += 1
+                    
+                    results.append({
+                        "flow_index": i,
+                        "prediction": prediction["prediction"],
+                        "probability": prediction["probability"],
+                        "is_attack": prediction["is_attack"],
+                        "confidence": prediction["confidence"]
+                    })
+                except Exception as e:
+                    results.append({
+                        "flow_index": i,
+                        "error": str(e)
+                    })
+            
+            summary = {
+                "total": len(results),
+                "attacks": attack_count,
+                "benign": benign_count,
+                "attack_rate": float(attack_count / len(results)) if results else 0.0
+            }
+            
+            return {
+                "filename": file.filename,
+                "status": "success",
+                "predictions": results,
+                "summary": summary
+            }
+            
+        finally:
+            # Cleanup temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="PyShark not installed. Run: pip install pyshark"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing PCAP: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn

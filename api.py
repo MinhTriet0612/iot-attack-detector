@@ -59,6 +59,13 @@ class BatchPredictionResponse(BaseModel):
     predictions: List[Dict[str, Any]]
     summary: Dict[str, Any]
 
+class LiveCaptureRequest(BaseModel):
+    """Request for live traffic capture"""
+    interface: Optional[str] = None  # Network interface. If None, auto-select
+    duration: Optional[int] = None  # Capture duration in seconds
+    packet_count: Optional[int] = None  # Number of packets to capture
+    display_filter: Optional[str] = None  # BPF filter (e.g., "tcp port 80")
+
 def load_model_artifacts(model_type='incremental'):
     """
     Load model, scaler, and feature columns
@@ -575,6 +582,165 @@ async def analyze_pcap(file: UploadFile = File(...)):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error analyzing PCAP: {str(e)}")
+
+
+@app.get("/interfaces")
+async def list_interfaces():
+    """
+    Liệt kê các network interfaces có sẵn.
+    
+    Returns:
+        Danh sách interfaces và interface được tự động chọn
+    """
+    try:
+        from pyshark_helper import get_available_interfaces, auto_select_interface
+        
+        interfaces = get_available_interfaces()
+        auto_selected = auto_select_interface()
+        
+        return {
+            "interfaces": interfaces,
+            "auto_selected": auto_selected,
+            "total": len(interfaces)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing interfaces: {str(e)}")
+
+
+@app.post("/capture/live")
+async def capture_live_traffic(request: LiveCaptureRequest):
+    """
+    Capture live network traffic từ interface và phân tích ngay.
+    
+    Args:
+        request: LiveCaptureRequest chứa:
+            - interface: Tên network interface (vd: 'wlp2s0', 'eth0'). Nếu None, tự động chọn
+            - duration: Thời gian capture (giây). Phải có duration hoặc packet_count
+            - packet_count: Số gói cần capture. Phải có duration hoặc packet_count
+            - display_filter: BPF filter tùy chọn (vd: 'tcp port 80')
+        
+    Returns:
+        Kết quả phân tích các flows từ live capture
+    """
+    if not model_loaded or model is None or scaler is None or feature_columns is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Model not loaded. Please check server logs."
+        )
+    
+    # Validate request
+    if not request.duration and not request.packet_count:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide either 'duration' (seconds) or 'packet_count'"
+        )
+    
+    if request.duration and request.duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Duration must be greater than 0"
+        )
+    
+    if request.packet_count and request.packet_count <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Packet count must be greater than 0"
+        )
+    
+    try:
+        # Import pyshark helper
+        from pyshark_helper import capture_live_traffic
+        
+        # Run capture in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            flow_features_list = await loop.run_in_executor(
+                executor,
+                capture_live_traffic,
+                request.interface,
+                request.duration,
+                request.packet_count,
+                request.display_filter
+            )
+        
+        # Lấy interface thực tế được sử dụng (có thể là auto-selected)
+        actual_interface = request.interface
+        if actual_interface is None:
+            from pyshark_helper import auto_select_interface
+            actual_interface = auto_select_interface()
+        
+        if not flow_features_list:
+            return {
+                "interface": actual_interface,
+                "auto_selected": request.interface is None,
+                "status": "no_flows",
+                "message": "No network flows found during capture",
+                "predictions": [],
+                "summary": {"total": 0, "attacks": 0, "benign": 0, "attack_rate": 0.0}
+            }
+        
+        # Predict each flow
+        results = []
+        attack_count = 0
+        benign_count = 0
+        
+        for i, flow_features in enumerate(flow_features_list):
+            try:
+                x_tensor = preprocess_flow(flow_features)
+                prediction = predict_single_flow(x_tensor)
+                
+                if prediction["is_attack"]:
+                    attack_count += 1
+                else:
+                    benign_count += 1
+                
+                results.append({
+                    "flow_index": i,
+                    "prediction": prediction["prediction"],
+                    "probability": prediction["probability"],
+                    "is_attack": prediction["is_attack"],
+                    "confidence": prediction["confidence"],
+                    "attack_probability": prediction.get("attack_probability", 0.0),
+                    "benign_probability": prediction.get("benign_probability", 0.0)
+                })
+            except Exception as e:
+                results.append({
+                    "flow_index": i,
+                    "error": str(e)
+                })
+        
+        summary = {
+            "total": len(results),
+            "attacks": attack_count,
+            "benign": benign_count,
+            "attack_rate": float(attack_count / len(results)) if results else 0.0
+        }
+        
+        return {
+            "interface": actual_interface,
+            "auto_selected": request.interface is None,
+            "duration": request.duration,
+            "packet_count": request.packet_count,
+            "filter": request.display_filter,
+            "status": "success",
+            "predictions": results,
+            "summary": summary
+        }
+        
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="PyShark not installed. Run: pip install pyshark"
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Permission denied. Live capture requires root privileges. Run API with sudo or set capabilities."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error capturing live traffic: {str(e)}")
 
 
 if __name__ == "__main__":

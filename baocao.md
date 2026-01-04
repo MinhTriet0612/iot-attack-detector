@@ -792,5 +792,3 @@ Nghiên cứu đã chứng minh tính khả thi và hiệu quả của việc s�
 [21] A. Paszke et al., "PyTorch: An imperative style, high-performance deep learning library," in *Proc. 33rd Int. Conf. Neural Inf. Process. Syst. (NeurIPS)*, 2019, pp. 8024-8035.
 
 [22] M. Fey and J. E. Lenssen, "Fast graph representation learning with PyTorch Geometric," in *Proc. ICLR Workshop Representation Learn. Graphs Manifolds*, 2019.
-
-[23] T. Brown et al., "Language models are few-shot learners," in *Proc. 34th Int. Conf. 

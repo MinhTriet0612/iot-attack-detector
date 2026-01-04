@@ -4,75 +4,92 @@ Hướng dẫn đơn giản nhất để phân tích network traffic với IoT A
 
 ---
 
-## 🚀 Quick Start (3 bước đơn giản)
+## 🚀 Quick Start (2 bước đơn giản - KHÔNG CẦN TSHARK!)
 
 ### Bước 1: Chạy API
 ```bash
-python api.py
+# Chạy với sudo để có quyền capture (hoặc set capabilities)
+sudo python api.py
 ```
 
-### Bước 2: Capture traffic
+### Bước 2: Capture và phân tích trực tiếp
 ```bash
-# Tìm tên interface của bạn
-ip link show
-
-# Capture 60 giây (thay wlp2s0 bằng interface của bạn)
-sudo tshark -i wlp2s0 -a duration:60 -w /tmp/traffic.pcap
-sudo chmod 644 /tmp/traffic.pcap
+# Tự động chọn interface và capture 60 giây
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 60}'
 ```
 
-### Bước 3: Phân tích
-```bash
-python test_pcap_endpoint.py /tmp/traffic.pcap
-```
-
-**Xong!** 🎉
+**Xong!** 🎉 Không cần tshark command line, không cần chỉ định interface!
 
 ---
 
 ## 📋 Chi tiết từng bước
 
-### 1️⃣ Tìm tên giao diện mạng
+### 1️⃣ Xem danh sách interfaces (Tùy chọn)
 
+```bash
+# Xem interfaces có sẵn và interface được tự động chọn
+curl "http://localhost:8000/interfaces"
+```
+
+Hoặc dùng lệnh:
 ```bash
 ip link show
 ```
 
 Output ví dụ:
-- `wlp2s0` ← Wi-Fi (dùng cái này nếu bạn dùng Wi-Fi)
+- `wlp2s0` ← Wi-Fi (thường được tự động chọn)
 - `eth0` hoặc `enp3s0` ← Ethernet
-- `lo` ← Loopback (không dùng)
+- `lo` ← Loopback (tự động bỏ qua)
 
-### 2️⃣ Capture network packets
+### 2️⃣ Capture và phân tích live traffic (MỚI! ✅)
 
-**Cách 1: Capture trong thời gian cố định**
+**Cách 1: Tự động chọn interface (Đơn giản nhất! ⭐)**
 ```bash
-sudo tshark -i wlp2s0 -a duration:60 -w /tmp/traffic.pcap
-sudo chmod 644 /tmp/traffic.pcap
+# Không cần chỉ định interface - tự động chọn!
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 60}'
 ```
 
-**Cách 2: Capture số gói cụ thể**
+**Cách 2: Chỉ định interface thủ công**
 ```bash
-sudo tshark -i wlp2s0 -c 100 -w /tmp/traffic.pcap
-sudo chmod 644 /tmp/traffic.pcap
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"interface": "wlp2s0", "duration": 60}'
 ```
 
-### 3️⃣ Phân tích file PCAP
+**Cách 3: Capture số gói cụ thể (tự động chọn interface)**
+```bash
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"packet_count": 100}'
+```
 
-**Cách 1: Dùng script test (Đơn giản nhất ✅)**
+**Cách 4: Capture với filter (chỉ HTTP/HTTPS)**
+```bash
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 60, "display_filter": "tcp port 80 or tcp port 443"}'
+```
+
+### 3️⃣ Phân tích file PCAP (nếu đã có file)
+
+**Cách 1: Upload file PCAP qua API**
+```bash
+curl -X POST "http://localhost:8000/analyze/pcap" \
+  -F "file=@/tmp/traffic.pcap"
+```
+
+**Cách 2: Dùng script test**
 ```bash
 python test_pcap_endpoint.py /tmp/traffic.pcap
 ```
 
-**Cách 2: Dùng Python script**
+**Cách 3: Dùng Python script**
 ```bash
 python wireshark_to_api.py /tmp/traffic.pcap
-```
-
-**Cách 3: Dùng curl để upload**
-```bash
-curl -X POST "http://localhost:8000/analyze/pcap" \
-  -F "file=@/tmp/traffic.pcap"
 ```
 
 ---
@@ -97,26 +114,30 @@ curl -X POST "http://localhost:8000/analyze/pcap" \
 | Vấn đề | Giải pháp |
 |--------|-----------|
 | `No such device` | Interface sai → Chạy `ip link show` |
-| `Permission denied` | Thêm `sudo` khi capture |
+| `Permission denied` | Chạy API với `sudo python api.py` hoặc set capabilities |
 | `Cannot connect to API` | Chạy `python api.py` trong terminal khác |
-| `tshark not found` | Cài: `sudo apt install tshark` |
+| `PyShark not installed` | Cài: `pip install pyshark` |
+| `tshark not found` | Cài: `sudo apt install tshark` (cần cho pyshark) |
 
 ---
 
-## 🎯 Bộ lọc hữu ích
+## 🎯 Bộ lọc hữu ích (dùng với display_filter)
 
 ```bash
 # Chỉ capture web traffic (HTTP/HTTPS)
-sudo tshark -i wlp2s0 -a duration:60 \
-  -f "tcp port 80 or tcp port 443" -w /tmp/web.pcap
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"interface": "wlp2s0", "duration": 60, "display_filter": "tcp port 80 or tcp port 443"}'
 
 # Chỉ capture DNS queries
-sudo tshark -i wlp2s0 -a duration:60 \
-  -f "udp port 53" -w /tmp/dns.pcap
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"interface": "wlp2s0", "duration": 60, "display_filter": "udp port 53"}'
 
 # Capture traffic đến IP cụ thể
-sudo tshark -i wlp2s0 -a duration:60 \
-  -f "host 192.168.1.1" -w /tmp/target.pcap
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"interface": "wlp2s0", "duration": 60, "display_filter": "host 192.168.1.1"}'
 ```
 
 ---
@@ -124,8 +145,38 @@ sudo tshark -i wlp2s0 -a duration:60 \
 ## 📝 One-liner (Copy & paste)
 
 ```bash
-# Capture 50 gói và phân tích ngay
-sudo tshark -i wlp2s0 -c 50 -w /tmp/test.pcap && \
-sudo chmod 644 /tmp/test.pcap && \
-python test_pcap_endpoint.py /tmp/test.pcap
+# Capture 50 gói và phân tích ngay (KHÔNG CẦN TSHARK, KHÔNG CẦN CHỈ ĐỊNH INTERFACE!)
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"packet_count": 50}'
 ```
+
+## 🔄 So sánh: Cách cũ vs Cách mới
+
+### ❌ Cách cũ (dùng tshark command line)
+```bash
+# Bước 1: Capture
+sudo tshark -i wlp2s0 -a duration:60 -w /tmp/traffic.pcap
+sudo chmod 644 /tmp/traffic.pcap
+
+# Bước 2: Phân tích
+python test_pcap_endpoint.py /tmp/traffic.pcap
+
+# Bước 3: Xóa file tạm
+rm /tmp/traffic.pcap
+```
+
+### ✅ Cách mới (dùng API - Đơn giản nhất!)
+```bash
+# Chỉ 1 bước: Capture và phân tích ngay (tự động chọn interface!)
+curl -X POST "http://localhost:8000/capture/live" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 60}'
+```
+
+**Lợi ích:**
+- ✅ Không cần file tạm
+- ✅ Không cần tshark command line
+- ✅ **Không cần chỉ định interface** - tự động chọn!
+- ✅ Tự động phân tích ngay sau khi capture
+- ✅ Dễ tích hợp vào ứng dụng khác

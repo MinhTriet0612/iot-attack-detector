@@ -250,6 +250,9 @@ class NetworkFlowGraphBuilder:
         else:
             X_normalized = self.scaler.transform(X)
         
+        # Ensure float32 to avoid dtype mismatch
+        X_normalized = X_normalized.astype(np.float32)
+        
         # Create simple graph: each flow is a node
         # Edges connect flows with similar characteristics
         num_nodes = len(X_normalized)
@@ -257,10 +260,10 @@ class NetworkFlowGraphBuilder:
         # Create edge index based on temporal proximity and feature similarity
         edge_index = self._create_edges(X_normalized, num_nodes)
         
-        # Convert to PyTorch tensors
-        x = torch.FloatTensor(X_normalized)
-        y_tensor = torch.LongTensor(y_binary)
-        edge_index_tensor = torch.LongTensor(edge_index)
+        # Convert to PyTorch tensors with explicit dtype
+        x = torch.from_numpy(X_normalized).float()
+        y_tensor = torch.from_numpy(y_binary).long()
+        edge_index_tensor = torch.from_numpy(edge_index).long()
         
         # Create PyTorch Geometric Data object
         graph_data = Data(x=x, edge_index=edge_index_tensor, y=y_tensor)
@@ -298,12 +301,12 @@ class NetworkFlowGraphBuilder:
             edge_list.append([i, j])
             edge_list.append([j, i])  # Undirected edge
         
-        # Convert to numpy array and transpose
+        # Convert to numpy array and transpose, ensure int64 for indexing
         if len(edge_list) > 0:
-            edge_index = np.array(edge_list).T
+            edge_index = np.array(edge_list, dtype=np.int64).T
         else:
             # Fallback: create simple sequential edges
-            edge_index = np.array([[i, i+1] for i in range(num_nodes-1)]).T
+            edge_index = np.array([[i, i+1] for i in range(num_nodes-1)], dtype=np.int64).T
         
         return edge_index
 
@@ -414,41 +417,103 @@ class GNNTrainer:
             delattr(self.data, 'test_mask')
         
     def split_data(self, train_ratio=0.7, val_ratio=0.15):
-        """Split data into train, validation, and test sets"""
+        """Split data into train, validation, and test sets with stratified sampling"""
         num_nodes = self.data.num_nodes
-        indices = torch.randperm(num_nodes, device=self.device)
+        y = self.data.y.cpu().numpy()
         
-        train_size = int(train_ratio * num_nodes)
-        val_size = int(val_ratio * num_nodes)
+        # Get indices for each class
+        benign_indices = np.where(y == 0)[0]
+        malicious_indices = np.where(y == 1)[0]
         
+        # Shuffle each class separately
+        np.random.seed(42)  # For reproducibility
+        np.random.shuffle(benign_indices)
+        np.random.shuffle(malicious_indices)
+        
+        # Calculate split sizes for each class
+        benign_train_size = int(train_ratio * len(benign_indices))
+        benign_val_size = int(val_ratio * len(benign_indices))
+        
+        malicious_train_size = int(train_ratio * len(malicious_indices))
+        malicious_val_size = int(val_ratio * len(malicious_indices))
+        
+        # Split each class
+        benign_train = benign_indices[:benign_train_size]
+        benign_val = benign_indices[benign_train_size:benign_train_size + benign_val_size]
+        benign_test = benign_indices[benign_train_size + benign_val_size:]
+        
+        malicious_train = malicious_indices[:malicious_train_size]
+        malicious_val = malicious_indices[malicious_train_size:malicious_train_size + malicious_val_size]
+        malicious_test = malicious_indices[malicious_train_size + malicious_val_size:]
+        
+        # Combine indices
+        train_indices = np.concatenate([benign_train, malicious_train])
+        val_indices = np.concatenate([benign_val, malicious_val])
+        test_indices = np.concatenate([benign_test, malicious_test])
+        
+        # Shuffle combined indices
+        np.random.shuffle(train_indices)
+        np.random.shuffle(val_indices)
+        np.random.shuffle(test_indices)
+        
+        # Create masks
         train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=self.device)
         val_mask = torch.zeros(num_nodes, dtype=torch.bool, device=self.device)
         test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=self.device)
         
-        train_mask[indices[:train_size]] = True
-        val_mask[indices[train_size:train_size + val_size]] = True
-        test_mask[indices[train_size + val_size:]] = True
+        # Ensure indices are int64 (long) for indexing
+        train_mask[torch.from_numpy(train_indices).long().to(self.device)] = True
+        val_mask[torch.from_numpy(val_indices).long().to(self.device)] = True
+        test_mask[torch.from_numpy(test_indices).long().to(self.device)] = True
         
         self.data.train_mask = train_mask
         self.data.val_mask = val_mask
         self.data.test_mask = test_mask
         
-        print(f"Data split: Train={train_size}, Val={val_size}, Test={num_nodes-train_size-val_size}")
+        # Print class distribution
+        train_benign = (self.data.y[train_mask] == 0).sum().item()
+        train_malicious = (self.data.y[train_mask] == 1).sum().item()
+        val_benign = (self.data.y[val_mask] == 0).sum().item()
+        val_malicious = (self.data.y[val_mask] == 1).sum().item()
+        test_benign = (self.data.y[test_mask] == 0).sum().item()
+        test_malicious = (self.data.y[test_mask] == 1).sum().item()
         
-    def train_epoch(self, optimizer):
+        print(f"Data split: Train={len(train_indices)}, Val={len(val_indices)}, Test={len(test_indices)}")
+        print(f"  Train: Benign={train_benign} ({train_benign/len(train_indices)*100:.1f}%), Malicious={train_malicious} ({train_malicious/len(train_indices)*100:.1f}%)")
+        print(f"  Val:   Benign={val_benign} ({val_benign/len(val_indices)*100:.1f}%), Malicious={val_malicious} ({val_malicious/len(val_indices)*100:.1f}%)")
+        print(f"  Test:  Benign={test_benign} ({test_benign/len(test_indices)*100:.1f}%), Malicious={test_malicious} ({test_malicious/len(test_indices)*100:.1f}%)")
+        
+    def train_epoch(self, optimizer, class_weights=None, debug=False):
         """Train for one epoch"""
         self.model.train()
         optimizer.zero_grad()
         
         out = self.model(self.data.x, self.data.edge_index)
-        loss = F.nll_loss(out[self.data.train_mask], self.data.y[self.data.train_mask])
+        y_train = self.data.y[self.data.train_mask]
+        
+        # Use class weights if provided
+        if class_weights is not None:
+            loss = F.nll_loss(out[self.data.train_mask], y_train, weight=class_weights)
+        else:
+            loss = F.nll_loss(out[self.data.train_mask], y_train)
         
         loss.backward()
         optimizer.step()
         
         # Calculate accuracy
         pred = out[self.data.train_mask].argmax(dim=1)
-        train_acc = (pred == self.data.y[self.data.train_mask]).sum().item() / self.data.train_mask.sum().item()
+        train_acc = (pred == y_train).sum().item() / self.data.train_mask.sum().item()
+        
+        # Debug: Check prediction distribution (only if debug=True and first epoch)
+        if debug:
+            pred_np = pred.cpu().numpy()
+            y_train_np = y_train.cpu().numpy()
+            benign_pred = (pred_np == 0).sum()
+            malicious_pred = (pred_np == 1).sum()
+            benign_true = (y_train_np == 0).sum()
+            malicious_true = (y_train_np == 1).sum()
+            print(f"    Train Predictions: Benign={benign_pred}, Malicious={malicious_pred} | "
+                  f"Train True: Benign={benign_true}, Malicious={malicious_true}")
         
         return loss.item(), train_acc
     
@@ -468,6 +533,33 @@ class GNNTrainer:
         """Full training loop"""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         
+        # Calculate class weights to handle imbalanced data
+        y_train = self.data.y[self.data.train_mask].cpu().numpy()
+        benign_count = (y_train == 0).sum()
+        malicious_count = (y_train == 1).sum()
+        total = len(y_train)
+        
+        # Enhanced inverse frequency weighting with stronger emphasis on minority class
+        # Use sqrt to reduce extreme weights, but still favor minority class
+        if benign_count > 0 and malicious_count > 0:
+            ratio = benign_count / malicious_count
+            # If benign is much more common, significantly boost malicious weight
+            if ratio > 5.0:  # Very imbalanced
+                weight_benign = 1.0
+                weight_malicious = min(ratio / 2.0, 10.0)  # Cap at 10x
+            else:
+                weight_benign = total / (2.0 * benign_count)
+                weight_malicious = total / (2.0 * malicious_count)
+        else:
+            weight_benign = 1.0
+            weight_malicious = 1.0
+        
+        class_weights = torch.tensor([weight_benign, weight_malicious], dtype=torch.float32, device=self.device)
+        
+        print(f"\nClass weights: Benign={weight_benign:.4f}, Malicious={weight_malicious:.4f}")
+        print(f"Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
+        print(f"Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
+        
         best_val_acc = 0
         patience = 20
         patience_counter = 0
@@ -480,15 +572,20 @@ class GNNTrainer:
             torch.cuda.empty_cache()
         
         for epoch in range(epochs):
-            train_loss, train_acc = self.train_epoch(optimizer)
-            val_loss, val_acc, _ = self.evaluate(self.data.val_mask)
+            # Debug on first epoch
+            debug = (epoch == 0)
+            train_loss, train_acc = self.train_epoch(optimizer, class_weights=class_weights, debug=debug)
+            val_loss, val_acc, val_pred = self.evaluate(self.data.val_mask)
             
-            self.history['train_loss'].append(train_loss)
-            self.history['train_acc'].append(train_acc)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_acc'].append(val_acc)
-            
+            # Debug: Check prediction distribution every 10 epochs
             if (epoch + 1) % 10 == 0:
+                val_pred_np = val_pred.cpu().numpy()
+                val_y_np = self.data.y[self.data.val_mask].cpu().numpy()
+                benign_pred_count = (val_pred_np == 0).sum()
+                malicious_pred_count = (val_pred_np == 1).sum()
+                benign_true_count = (val_y_np == 0).sum()
+                malicious_true_count = (val_y_np == 1).sum()
+                
                 gpu_info = ""
                 if self.device.type == 'cuda':
                     allocated = torch.cuda.memory_allocated(self.device) / 1024**3
@@ -497,6 +594,13 @@ class GNNTrainer:
                 
                 print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
                       f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}{gpu_info}")
+                print(f"  Val Predictions: Benign={benign_pred_count}, Malicious={malicious_pred_count} | "
+                      f"Val True: Benign={benign_true_count}, Malicious={malicious_true_count}")
+            
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
             
             # Early stopping
             if val_acc > best_val_acc:
@@ -541,6 +645,34 @@ class GNNTrainer:
             optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
             self.optimizer = optimizer
         
+        # Calculate class weights to handle imbalanced data
+        y_train = self.data.y[self.data.train_mask].cpu().numpy()
+        benign_count = (y_train == 0).sum()
+        malicious_count = (y_train == 1).sum()
+        total = len(y_train)
+        
+        # Enhanced inverse frequency weighting with stronger emphasis on minority class
+        if benign_count > 0 and malicious_count > 0:
+            ratio = benign_count / malicious_count
+            # If benign is much more common, significantly boost malicious weight
+            if ratio > 5.0:  # Very imbalanced
+                weight_benign = 1.0
+                weight_malicious = min(ratio / 2.0, 10.0)  # Cap at 10x
+            else:
+                weight_benign = total / (2.0 * benign_count)
+                weight_malicious = total / (2.0 * malicious_count)
+        else:
+            weight_benign = 1.0
+            weight_malicious = 1.0
+        
+        class_weights = torch.tensor([weight_benign, weight_malicious], dtype=torch.float32, device=self.device)
+        
+        if not continue_training or not hasattr(self, '_printed_weights'):
+            print(f"  Class weights: Benign={weight_benign:.4f}, Malicious={weight_malicious:.4f}")
+            print(f"  Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
+            print(f"  Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
+            self._printed_weights = True
+        
         best_val_acc = 0
         patience = 10  # Shorter patience for incremental training
         patience_counter = 0
@@ -550,8 +682,10 @@ class GNNTrainer:
             torch.cuda.empty_cache()
         
         for epoch in range(epochs_per_file):
-            train_loss, train_acc = self.train_epoch(optimizer)
-            val_loss, val_acc, _ = self.evaluate(self.data.val_mask)
+            # Debug on first epoch of first file
+            debug = (epoch == 0 and not continue_training)
+            train_loss, train_acc = self.train_epoch(optimizer, class_weights=class_weights, debug=debug)
+            val_loss, val_acc, val_pred = self.evaluate(self.data.val_mask)
             
             # Store in local history
             self.history['train_loss'].append(train_loss)
@@ -566,6 +700,14 @@ class GNNTrainer:
             self.global_history['val_acc'].append(val_acc)
             
             if (epoch + 1) % 10 == 0:
+                # Debug: Check prediction distribution
+                val_pred_np = val_pred.cpu().numpy()
+                val_y_np = self.data.y[self.data.val_mask].cpu().numpy()
+                benign_pred_count = (val_pred_np == 0).sum()
+                malicious_pred_count = (val_pred_np == 1).sum()
+                benign_true_count = (val_y_np == 0).sum()
+                malicious_true_count = (val_y_np == 1).sum()
+                
                 gpu_info = ""
                 if self.device.type == 'cuda':
                     allocated = torch.cuda.memory_allocated(self.device) / 1024**3
@@ -574,6 +716,8 @@ class GNNTrainer:
                 
                 print(f"  Epoch {epoch+1:03d}/{epochs_per_file} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
                       f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}{gpu_info}")
+                print(f"    Val Predictions: Benign={benign_pred_count}, Malicious={malicious_pred_count} | "
+                      f"Val True: Benign={benign_true_count}, Malicious={malicious_true_count}")
             
             # Early stopping
             if val_acc > best_val_acc:
@@ -607,12 +751,23 @@ class GNNTrainer:
         print(f"Test Accuracy: {test_acc:.4f}")
         print(f"Test Loss: {test_loss:.4f}")
         
+        # Calculate per-class metrics
+        benign_pred = (y_pred == 0).sum()
+        malicious_pred = (y_pred == 1).sum()
+        benign_true = (y_true == 0).sum()
+        malicious_true = (y_true == 1).sum()
+        
+        print(f"\nTrue labels:  Benign={benign_true}, Malicious={malicious_true}")
+        print(f"Predictions:  Benign={benign_pred}, Malicious={malicious_pred}")
+        
         print("\nClassification Report:")
         print(classification_report(y_true, y_pred, target_names=['Benign', 'Malicious']))
         
         print("\nConfusion Matrix:")
         cm = confusion_matrix(y_true, y_pred)
         print(cm)
+        print(f"  [Benign predicted as Benign: {cm[0,0]}, as Malicious: {cm[0,1]}]")
+        print(f"  [Malicious predicted as Benign: {cm[1,0]}, as Malicious: {cm[1,1]}]")
         
         # Calculate ROC-AUC
         out = self.model(self.data.x, self.data.edge_index)
@@ -859,6 +1014,16 @@ def train_incremental_pipeline(dataset_folder, force_cpu=False, epochs_per_file=
     print(f"\nFinal model saved to: best_gnn_model_incremental.pt")
     print(f"Scaler saved to: scaler_incremental.pkl")
     print(f"Feature columns saved to: feature_columns_incremental.pkl")
+    
+    # Plot training history from global_history (all files combined)
+    if trainer and trainer.global_history and len(trainer.global_history['train_loss']) > 0:
+        print(f"\n[STEP 8] Generating training history visualization...")
+        # Temporarily swap history to use global_history for plotting
+        original_history = trainer.history
+        trainer.history = trainer.global_history
+        trainer.plot_training_history()
+        trainer.history = original_history
+        print(f"Training history saved to: training_history.png")
     
     return trainer, all_results
 

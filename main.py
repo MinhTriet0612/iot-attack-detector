@@ -1030,4 +1030,4 @@ if __name__ == "__main__":
     #        print(f"GPU: {torch.cuda.get_device_name(0)}")
     
     # Use incremental mode for memory-efficient training
-    trainer, results = main(incremental=True, epochs_per_file=50)
+    trainer, results = main(incremental=True, epochs_per_file=30)

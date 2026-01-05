@@ -498,6 +498,9 @@ class GNNTrainer:
             loss = F.nll_loss(out[self.data.train_mask], y_train)
         
         loss.backward()
+        # Gradient clipping to prevent explosion when switching to new data
+        # Use higher max_norm to allow more gradient flow
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
         optimizer.step()
         
         # Calculate accuracy
@@ -539,24 +542,42 @@ class GNNTrainer:
         malicious_count = (y_train == 1).sum()
         total = len(y_train)
         
-        # Enhanced inverse frequency weighting with stronger emphasis on minority class
-        # Use sqrt to reduce extreme weights, but still favor minority class
+        # Balanced class weights - stronger boost for Malicious to handle severe imbalance
         if benign_count > 0 and malicious_count > 0:
             ratio = benign_count / malicious_count
-            # If benign is much more common, significantly boost malicious weight
-            if ratio > 5.0:  # Very imbalanced
+            # Stronger weighting for Malicious to prevent 100% Benign predictions
+            if ratio > 10.0:  # Extremely imbalanced (Benign >> Malicious)
+                # Strong weight for Malicious
                 weight_benign = 1.0
-                weight_malicious = min(ratio / 2.0, 10.0)  # Cap at 10x
+                weight_malicious = min(ratio * 0.5, 8.0)  # Cap at 8x, use 50% of ratio
+            elif ratio > 5.0:  # Very imbalanced
+                weight_benign = 1.0
+                weight_malicious = min(ratio * 0.55, 7.0)  # Cap at 7x, use 55% of ratio
+            elif ratio < 0.1:  # Malicious is extremely more common
+                weight_benign = min(1.0 / ratio * 0.5, 8.0)
+                weight_malicious = 1.0
+            elif ratio < 0.2:  # Malicious is much more common
+                weight_benign = min(1.0 / ratio * 0.55, 7.0)
+                weight_malicious = 1.0
             else:
+                # Balanced inverse frequency with stronger Malicious boost
                 weight_benign = total / (2.0 * benign_count)
-                weight_malicious = total / (2.0 * malicious_count)
+                weight_malicious = (total / (2.0 * malicious_count)) * 1.6  # Boost by 60%
         else:
             weight_benign = 1.0
             weight_malicious = 1.0
         
+        # Always normalize to keep weights in reasonable range
+        # This prevents extreme bias while maintaining class balance
+        weight_sum = weight_benign + weight_malicious
+        weight_benign = weight_benign / weight_sum * 2.0
+        weight_malicious = weight_malicious / weight_sum * 2.0
+        
         class_weights = torch.tensor([weight_benign, weight_malicious], dtype=torch.float32, device=self.device)
         
+        weight_ratio = weight_malicious / weight_benign if weight_benign > 0 else 0
         print(f"\nClass weights: Benign={weight_benign:.4f}, Malicious={weight_malicious:.4f}")
+        print(f"Weight ratio (Malicious/Benign): {weight_ratio:.4f}")
         print(f"Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
         print(f"Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
         
@@ -640,10 +661,17 @@ class GNNTrainer:
             Best validation accuracy for this file
         """
         if continue_training and hasattr(self, 'optimizer'):
+            # Use existing optimizer but slightly reduce learning rate for new data
             optimizer = self.optimizer
+            # Use 80% of original LR for smoother adaptation (less aggressive)
+            adaptation_lr = lr * 0.8
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = adaptation_lr
+            print(f"  Adapting to new data: Using reduced LR {adaptation_lr:.6f} (will warm-up to {lr:.6f})")
         else:
             optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
             self.optimizer = optimizer
+            print(f"  Initializing optimizer with LR {lr:.6f}")
         
         # Calculate class weights to handle imbalanced data
         y_train = self.data.y[self.data.train_mask].cpu().numpy()
@@ -651,24 +679,43 @@ class GNNTrainer:
         malicious_count = (y_train == 1).sum()
         total = len(y_train)
         
-        # Enhanced inverse frequency weighting with stronger emphasis on minority class
+        # Balanced class weights - stronger boost for Malicious to handle severe imbalance
         if benign_count > 0 and malicious_count > 0:
             ratio = benign_count / malicious_count
-            # If benign is much more common, significantly boost malicious weight
-            if ratio > 5.0:  # Very imbalanced
+            # Stronger weighting for Malicious to prevent 100% Benign predictions
+            if ratio > 10.0:  # Extremely imbalanced (Benign >> Malicious)
+                # Strong weight for Malicious
                 weight_benign = 1.0
-                weight_malicious = min(ratio / 2.0, 10.0)  # Cap at 10x
+                weight_malicious = min(ratio * 0.5, 8.0)  # Cap at 8x, use 50% of ratio
+            elif ratio > 5.0:  # Very imbalanced
+                weight_benign = 1.0
+                weight_malicious = min(ratio * 0.55, 7.0)  # Cap at 7x, use 55% of ratio
+            elif ratio < 0.1:  # Malicious is extremely more common
+                weight_benign = min(1.0 / ratio * 0.5, 8.0)
+                weight_malicious = 1.0
+            elif ratio < 0.2:  # Malicious is much more common
+                weight_benign = min(1.0 / ratio * 0.55, 7.0)
+                weight_malicious = 1.0
             else:
+                # Balanced inverse frequency with stronger Malicious boost
                 weight_benign = total / (2.0 * benign_count)
-                weight_malicious = total / (2.0 * malicious_count)
+                weight_malicious = (total / (2.0 * malicious_count)) * 1.6  # Boost by 60%
         else:
             weight_benign = 1.0
             weight_malicious = 1.0
         
+        # Always normalize to keep weights in reasonable range
+        # This prevents extreme bias while maintaining class balance
+        weight_sum = weight_benign + weight_malicious
+        weight_benign = weight_benign / weight_sum * 2.0
+        weight_malicious = weight_malicious / weight_sum * 2.0
+        
         class_weights = torch.tensor([weight_benign, weight_malicious], dtype=torch.float32, device=self.device)
         
         if not continue_training or not hasattr(self, '_printed_weights'):
+            weight_ratio = weight_malicious / weight_benign if weight_benign > 0 else 0
             print(f"  Class weights: Benign={weight_benign:.4f}, Malicious={weight_malicious:.4f}")
+            print(f"  Weight ratio (Malicious/Benign): {weight_ratio:.4f}")
             print(f"  Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
             print(f"  Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
             self._printed_weights = True
@@ -681,7 +728,22 @@ class GNNTrainer:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         
+        # Warm-up phase: use lower learning rate for first few epochs when switching files
+        warmup_epochs = 3 if continue_training else 0  # Reduced from 5 to 3
+        initial_lr = optimizer.param_groups[0]['lr']
+        target_lr = lr  # Target learning rate after warm-up
+        
         for epoch in range(epochs_per_file):
+            # Warm-up: gradually increase learning rate for first few epochs
+            if epoch < warmup_epochs and continue_training:
+                warmup_lr = initial_lr + (target_lr - initial_lr) * (epoch + 1) / warmup_epochs
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
+            elif epoch == warmup_epochs and continue_training:
+                # Restore target learning rate after warm-up
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = target_lr
+            
             # Debug on first epoch of first file
             debug = (epoch == 0 and not continue_training)
             train_loss, train_acc = self.train_epoch(optimizer, class_weights=class_weights, debug=debug)

@@ -327,7 +327,7 @@ class GCN_IoT_Classifier(nn.Module):
         self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
         self.lin2 = nn.Linear(hidden_channels // 2, num_classes)
         
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.5)
         
     def forward(self, x, edge_index, batch=None):
         # Graph convolution layers
@@ -483,8 +483,8 @@ class GNNTrainer:
         print(f"  Val:   Benign={val_benign} ({val_benign/len(val_indices)*100:.1f}%), Malicious={val_malicious} ({val_malicious/len(val_indices)*100:.1f}%)")
         print(f"  Test:  Benign={test_benign} ({test_benign/len(test_indices)*100:.1f}%), Malicious={test_malicious} ({test_malicious/len(test_indices)*100:.1f}%)")
         
-    def train_epoch(self, optimizer, class_weights=None, debug=False):
-        """Train for one epoch"""
+    def train_epoch(self, optimizer, class_weights=None, debug=False, skip_threshold=10.0):
+        """Train for one epoch with improved stability"""
         self.model.train()
         optimizer.zero_grad()
         
@@ -497,10 +497,25 @@ class GNNTrainer:
         else:
             loss = F.nll_loss(out[self.data.train_mask], y_train)
         
+        loss_value = loss.item()
+        
+        # Skip update if loss spike detected (prevents gradient explosion)
+        if loss_value > skip_threshold:
+            if debug:
+                print(f"    ⚠ Skipping update due to loss spike: {loss_value:.4f} > {skip_threshold}")
+            return loss_value, 0.0  # Return current loss but skip update
+        
         loss.backward()
-        # Gradient clipping to prevent explosion when switching to new data
-        # Use higher max_norm to allow more gradient flow
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+        # Stricter gradient clipping to prevent explosion
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        
+        # Additional check: skip if gradient norm is still too large after clipping
+        if grad_norm > 5.0:
+            optimizer.zero_grad()  # Clear gradients
+            if debug:
+                print(f"    ⚠ Skipping update due to large gradient norm: {grad_norm:.4f}")
+            return loss_value, 0.0
+        
         optimizer.step()
         
         # Calculate accuracy
@@ -517,8 +532,9 @@ class GNNTrainer:
             malicious_true = (y_train_np == 1).sum()
             print(f"    Train Predictions: Benign={benign_pred}, Malicious={malicious_pred} | "
                   f"Train True: Benign={benign_true}, Malicious={malicious_true}")
+            print(f"    Gradient norm: {grad_norm:.4f}")
         
-        return loss.item(), train_acc
+        return loss_value, train_acc
     
     @torch.no_grad()
     def evaluate(self, mask):
@@ -532,9 +548,14 @@ class GNNTrainer:
         
         return loss.item(), acc, pred
     
-    def train(self, epochs=100, lr=0.01, weight_decay=5e-4):
-        """Full training loop"""
+    def train(self, epochs=100, lr=0.0005, weight_decay=5e-4):
+        """Full training loop with improved stability techniques"""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        
+        # Learning rate scheduler: reduce LR on plateau
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
+        )
         
         # Calculate class weights to handle imbalanced data
         y_train = self.data.y[self.data.train_mask].cpu().numpy()
@@ -580,10 +601,13 @@ class GNNTrainer:
         print(f"Weight ratio (Malicious/Benign): {weight_ratio:.4f}")
         print(f"Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
         print(f"Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
+        print(f"Using Learning Rate Scheduler: ReduceLROnPlateau")
         
         best_val_acc = 0
-        patience = 20
+        best_val_loss = float('inf')
+        patience = 15
         patience_counter = 0
+        previous_val_loss = float('inf')
         
         print("\nTraining started...")
         print("-" * 80)
@@ -597,6 +621,10 @@ class GNNTrainer:
             debug = (epoch == 0)
             train_loss, train_acc = self.train_epoch(optimizer, class_weights=class_weights, debug=debug)
             val_loss, val_acc, val_pred = self.evaluate(self.data.val_mask)
+            
+            # Update learning rate scheduler
+            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
             
             # Debug: Check prediction distribution every 10 epochs
             if (epoch + 1) % 10 == 0:
@@ -614,7 +642,7 @@ class GNNTrainer:
                     gpu_info = f" | GPU Mem: {allocated:.2f}/{reserved:.2f} GB"
                 
                 print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-                      f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}{gpu_info}")
+                      f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.6f}{gpu_info}")
                 print(f"  Val Predictions: Benign={benign_pred_count}, Malicious={malicious_pred_count} | "
                       f"Val True: Benign={benign_true_count}, Malicious={malicious_true_count}")
             
@@ -623,20 +651,43 @@ class GNNTrainer:
             self.history['val_loss'].append(val_loss)
             self.history['val_acc'].append(val_acc)
             
-            # Early stopping
+            # Save model at best performance (accuracy >= 95%, loss <= 0.2)
+            is_best_performance = (val_acc >= 0.95 and val_loss <= 0.2)
+            
+            # Early stopping: Stop at epoch ~100 if best performance achieved
+            if is_best_performance and epoch >= 50 and epoch < 110:
+                print(f"\n✓ Best performance achieved at epoch {epoch+1}: Val Acc={val_acc:.4f}, Val Loss={val_loss:.4f}")
+                print(f"  Stopping training early to preserve best model (epoch ~100)")
+                torch.save(self.model.state_dict(), 'best_gnn_model.pt')
+                break
+            
+            # Early stopping based on both accuracy and loss
+            improved = False
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                improved = True
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                improved = True
+            
+            # Save model if: best performance achieved OR improved metrics
+            if is_best_performance or improved:
                 patience_counter = 0
+                # Save model at best performance
                 torch.save(self.model.state_dict(), 'best_gnn_model.pt')
+                if is_best_performance:
+                    print(f"  ✓ Saved best model at epoch {epoch+1}: Val Acc={val_acc:.4f}, Val Loss={val_loss:.4f}")
             else:
                 patience_counter += 1
                 
             if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch+1}")
+                print(f"\nEarly stopping at epoch {epoch+1} (no improvement)")
                 break
+            
+            previous_val_loss = val_loss
         
         print("-" * 80)
-        print(f"Training complete. Best validation accuracy: {best_val_acc:.4f}")
+        print(f"Training complete. Best validation accuracy: {best_val_acc:.4f}, Best validation loss: {best_val_loss:.4f}")
         
         # Load best model
         self.model.load_state_dict(torch.load('best_gnn_model.pt'))
@@ -647,9 +698,10 @@ class GNNTrainer:
         
         return best_val_acc
     
-    def train_incremental(self, epochs_per_file=50, lr=0.01, weight_decay=5e-4, continue_training=True):
+    def train_incremental(self, epochs_per_file=50, lr=0.0005, weight_decay=5e-4, continue_training=True):
         """
         Train incrementally on current data (for use in incremental pipeline)
+        Improved with stability techniques
         
         Args:
             epochs_per_file: Number of epochs to train on each file
@@ -661,17 +713,22 @@ class GNNTrainer:
             Best validation accuracy for this file
         """
         if continue_training and hasattr(self, 'optimizer'):
-            # Use existing optimizer but slightly reduce learning rate for new data
+            # Use existing optimizer, keep same learning rate (no warmup/restart)
             optimizer = self.optimizer
-            # Use 80% of original LR for smoother adaptation (less aggressive)
-            adaptation_lr = lr * 0.8
+            # Keep same LR to avoid instability
             for param_group in optimizer.param_groups:
-                param_group['lr'] = adaptation_lr
-            print(f"  Adapting to new data: Using reduced LR {adaptation_lr:.6f} (will warm-up to {lr:.6f})")
+                param_group['lr'] = lr
+            print(f"  Continuing training with LR {lr:.6f}")
         else:
             optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
             self.optimizer = optimizer
             print(f"  Initializing optimizer with LR {lr:.6f}")
+        
+        # Learning rate scheduler for incremental training
+        if not hasattr(self, 'scheduler') or not continue_training:
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.7, patience=5, min_lr=1e-6
+            )
         
         # Calculate class weights to handle imbalanced data
         y_train = self.data.y[self.data.train_mask].cpu().numpy()
@@ -718,36 +775,30 @@ class GNNTrainer:
             print(f"  Weight ratio (Malicious/Benign): {weight_ratio:.4f}")
             print(f"  Training set: Benign={benign_count} ({benign_count/total*100:.1f}%), Malicious={malicious_count} ({malicious_count/total*100:.1f}%)")
             print(f"  Class ratio (Benign/Malicious): {benign_count/malicious_count if malicious_count > 0 else 'N/A':.2f}")
+            print(f"  Using Learning Rate Scheduler: ReduceLROnPlateau")
             self._printed_weights = True
         
         best_val_acc = 0
-        patience = 10  # Shorter patience for incremental training
+        best_val_loss = float('inf')
+        best_model_state = None  # Store best model state
+        patience = 12  # Early stopping after 12 epochs without improvement
         patience_counter = 0
+        import copy
         
         # Clear GPU cache before training
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        # Warm-up phase: use lower learning rate for first few epochs when switching files
-        warmup_epochs = 3 if continue_training else 0  # Reduced from 5 to 3
-        initial_lr = optimizer.param_groups[0]['lr']
-        target_lr = lr  # Target learning rate after warm-up
-        
+        # No warmup/restart mechanism to avoid collapse
         for epoch in range(epochs_per_file):
-            # Warm-up: gradually increase learning rate for first few epochs
-            if epoch < warmup_epochs and continue_training:
-                warmup_lr = initial_lr + (target_lr - initial_lr) * (epoch + 1) / warmup_epochs
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = warmup_lr
-            elif epoch == warmup_epochs and continue_training:
-                # Restore target learning rate after warm-up
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = target_lr
-            
             # Debug on first epoch of first file
             debug = (epoch == 0 and not continue_training)
             train_loss, train_acc = self.train_epoch(optimizer, class_weights=class_weights, debug=debug)
             val_loss, val_acc, val_pred = self.evaluate(self.data.val_mask)
+            
+            # Update learning rate scheduler
+            self.scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
             
             # Store in local history
             self.history['train_loss'].append(train_loss)
@@ -777,20 +828,50 @@ class GNNTrainer:
                     gpu_info = f" | GPU Mem: {allocated:.2f}/{reserved:.2f} GB"
                 
                 print(f"  Epoch {epoch+1:03d}/{epochs_per_file} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-                      f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}{gpu_info}")
+                      f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.6f}{gpu_info}")
                 print(f"    Val Predictions: Benign={benign_pred_count}, Malicious={malicious_pred_count} | "
                       f"Val True: Benign={benign_true_count}, Malicious={malicious_true_count}")
             
-            # Early stopping
+            # Save model at best performance (accuracy >= 95%, loss <= 0.2)
+            is_best_performance = (val_acc >= 0.95 and val_loss <= 0.2)
+            
+            # Early stopping: Stop at epoch ~100 if best performance achieved (for incremental, track global epoch)
+            global_epoch = len(self.global_history['train_loss'])  # Approximate global epoch
+            if is_best_performance and global_epoch >= 50 and global_epoch < 110:
+                print(f"  ✓ Best performance achieved at global epoch ~{global_epoch}: Val Acc={val_acc:.4f}, Val Loss={val_loss:.4f}")
+                print(f"    Stopping training early to preserve best model (epoch ~100)")
+                import copy
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                break
+            
+            # Early stopping based on both accuracy and loss
+            improved = False
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+                improved = True
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                improved = True
+            
+            # Save model if: best performance achieved OR improved metrics
+            if is_best_performance or improved:
                 patience_counter = 0
+                # Store best model state
+                import copy
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                if is_best_performance:
+                    print(f"    ✓ Best performance at epoch {epoch+1}: Val Acc={val_acc:.4f}, Val Loss={val_loss:.4f}")
             else:
                 patience_counter += 1
                 
             if patience_counter >= patience:
                 print(f"  Early stopping at epoch {epoch+1}")
                 break
+        
+        # Restore best model state if available
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            print(f"  Restored best model: Val Acc={best_val_acc:.4f}, Val Loss={best_val_loss:.4f}")
         
         # Clear GPU cache after training
         if self.device.type == 'cuda':
@@ -1003,7 +1084,7 @@ def train_incremental_pipeline(dataset_folder, force_cpu=False, epochs_per_file=
             print(f"\n[STEP 5] Training on file {file_idx}/{len(csv_files)}...")
             best_val_acc = trainer.train_incremental(
                 epochs_per_file=epochs_per_file,
-                lr=0.01,
+                lr=0.0005,
                 weight_decay=5e-4,
                 continue_training=(file_idx > 1)  # Continue training from file 2 onwards
             )
@@ -1199,7 +1280,7 @@ def main(force_cpu=False, incremental=False, epochs_per_file=50):
     print("\n[STEP 4] Training model...")
     trainer = GNNTrainer(model, graph_data, device=device)
     trainer.split_data(train_ratio=0.7, val_ratio=0.15)
-    trainer.train(epochs=100, lr=0.01, weight_decay=5e-4)
+    trainer.train(epochs=100, lr=0.0005, weight_decay=5e-4)
     
     # 5. Evaluate
     print("\n[STEP 5] Evaluating model...")
